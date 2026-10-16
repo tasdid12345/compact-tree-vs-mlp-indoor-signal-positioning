@@ -1,28 +1,15 @@
-# Small tuned LightGBM vs. MLP for indoor localization
+# LightGBM vs MLP on UCI Wireless Indoor Localization
 
-## Motivation
-The paper "EDEEPRFID-IPS: Enhanced RFID indoor positioning with deep learning for internet of things" (2023) proposes a deep learning model for indoor positioning from RFID signals. Deep models can be costly on small IoT devices, so this experiment checks whether a small, cross-validation-tuned gradient-boosted tree model can match a standard neural network while being cheaper per prediction.
+Question: can a small, cross-validation-tuned LightGBM classifier match or beat a standard MLP at indoor location classification from signal-strength readings, while being cheaper per prediction?
 
-## Question
-Can a small CV-tuned LightGBM model match or beat a standard MLP at indoor location classification from signal-strength readings, while being cheaper to run per prediction?
+- Dataset: UCI Wireless Indoor Localization (id 422), 2000 rows, 7 WiFi signal-strength features, 4 classes. It is downloaded directly from the UCI static file, with `ucimlrepo` as a fallback. The `ucimlrepo` import of id 422 failed in CI, which is why the direct download was added.
+- Split: one stratified 80/20 split, seed 42. The scaler is fit on the training set only.
+- Baseline: scikit-learn `MLPClassifier` (100 hidden units, max_iter=500).
+- Improved: small LightGBM, tuned with 5-fold CV on the training set only.
+- Final models are run with seeds 42, 43 and 44, and the means are reported. The test set is used once.
+- Output: `results.json` and `figures/comparison.png`.
 
-## Dataset
-UCI Wireless Indoor Localization (ucimlrepo id 422): 7 Wi-Fi signal-strength readings, 4 room labels. This is **not** the paper's dataset (which is not stated); it is used as a stand-in for RFID signal data.
-
-## Baseline vs. improved
-- **Baseline:** scikit-learn `MLPClassifier` with default-style settings (standing in for the paper's deep model; not the paper's own method).
-- **Improved:** a small LightGBM classifier (shallow trees, few rounds) tuned by 5-fold cross-validation on the training set only.
-
-Both use one stratified 80/20 split (seed 42), the same standardisation, the same evaluation and timing code. Metrics: test accuracy (main), macro-F1, and inference time per sample (µs). Models are run with seeds 42, 43, 44.
-
-## How to run
-```
-pip install -r requirements.txt
-python analysis.py
-```
-
-## Results
-Results are written to `results.json` (and a chart to `figures/`).
+Run: `pip install -r requirements.txt && python analysis.py`
 
 ## Reference
 

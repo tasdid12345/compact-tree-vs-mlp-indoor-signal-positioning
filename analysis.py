@@ -1,6 +1,8 @@
 """LightGBM (CV-tuned, small) vs MLP on UCI Wireless Indoor Localization (id 422)."""
-import json, os, sys, time
+import io, json, os, sys, time, zipfile
 import numpy as np
+import pandas as pd
+import requests
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -9,21 +11,48 @@ from sklearn.metrics import accuracy_score, f1_score
 from sklearn.model_selection import GridSearchCV, StratifiedKFold, train_test_split
 from sklearn.neural_network import MLPClassifier
 from sklearn.preprocessing import LabelEncoder, StandardScaler
-from ucimlrepo import fetch_ucirepo
 
 SEEDS = [42, 43, 44]
 np.random.seed(42)
 
+URLS = [
+    "https://archive.ics.uci.edu/static/public/422/wireless+indoor+localization.zip",
+    "https://archive.ics.uci.edu/ml/machine-learning-databases/00422/wifi_localization.txt",
+]
+
+
+def _parse(content):
+    """Parse raw bytes (zip archive or plain text) of wifi_localization into a DataFrame."""
+    if content[:2] == b"PK":
+        with zipfile.ZipFile(io.BytesIO(content)) as z:
+            names = [n for n in z.namelist() if n.lower().endswith(".txt")]
+            if not names:
+                raise ValueError("no txt file in archive")
+            content = z.read(names[0])
+    df = pd.read_csv(io.BytesIO(content), sep=r"\s+", header=None)
+    if df.shape[1] != 8:
+        raise ValueError(f"unexpected shape {df.shape}")
+    return df
+
 
 def load():
-    """Fetch the dataset with retry and exponential backoff."""
-    for i in range(5):
+    """Fetch the dataset (direct UCI files, then ucimlrepo) with retry and backoff."""
+    for i in range(3):
+        for url in URLS:
+            try:
+                r = requests.get(url, timeout=60)
+                r.raise_for_status()
+                df = _parse(r.content)
+                return df.iloc[:, :7].to_numpy(float), df.iloc[:, 7].to_numpy()
+            except Exception as e:
+                print(f"download failed for {url} ({e}); attempt {i + 1}/3", flush=True)
         try:
+            from ucimlrepo import fetch_ucirepo
             d = fetch_ucirepo(id=422)
             return d.data.features.to_numpy(float), d.data.targets.iloc[:, 0].to_numpy()
         except Exception as e:
-            print(f"download failed ({e}); retry {i + 1}/5", flush=True)
-            time.sleep(2 ** (i + 1))
+            print(f"ucimlrepo failed ({e}); attempt {i + 1}/3", flush=True)
+        time.sleep(2 ** (i + 1))
     sys.exit("could not download dataset")
 
 
@@ -125,6 +154,7 @@ out = {
     "metrics": metrics,
     "notes": (f"Stand-in dataset, not the paper's RFID data; the paper's model (EDEEPRFID-IPS) is not reproduced. "
               f"Selected LightGBM params: {best}. Hyper-parameters tuned once with seed 42; seeds only change final fits. "
+              "Data downloaded directly from the UCI static file (ucimlrepo import of id 422 is not available). "
               "Timing is wall-clock on the CI CPU: LightGBM uses n_jobs=1, but the MLP's BLAS threads are not restricted, and "
               "timings are noisy and are not measurements on a real small device. Accuracy differences may be within seed/split noise (single split)."),
 }
