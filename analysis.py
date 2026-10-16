@@ -1,5 +1,6 @@
-"""LightGBM (CV-tuned, small) vs MLP on UCI Wireless Indoor Localization (id 422)."""
+"""CV-tuned LightGBM / SVM / ExtraTrees ensemble vs a standard MLP on UCI Wireless Indoor Localization (id 422)."""
 import io, json, os, sys, time, zipfile
+from itertools import combinations
 import numpy as np
 import pandas as pd
 import requests
@@ -7,10 +8,13 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from lightgbm import LGBMClassifier
+from sklearn.ensemble import ExtraTreesClassifier, VotingClassifier
 from sklearn.metrics import accuracy_score, f1_score
-from sklearn.model_selection import GridSearchCV, StratifiedKFold, train_test_split
+from sklearn.model_selection import GridSearchCV, StratifiedKFold, cross_val_score, train_test_split
 from sklearn.neural_network import MLPClassifier
-from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import FunctionTransformer, LabelEncoder, StandardScaler
+from sklearn.svm import SVC
 
 SEEDS = [42, 43, 44]
 np.random.seed(42)
@@ -82,6 +86,34 @@ def evaluate(model, X, y):
                 us_batch=us_per_sample(model, X, False), us_single=us_per_sample(model, X, True))
 
 
+def add_diffs(X):
+    """Feature engineering: raw signals plus all pairwise differences between the 7 signal strengths."""
+    X = np.asarray(X)
+    d = [X[:, i] - X[:, j] for i, j in combinations(range(X.shape[1]), 2)]
+    return np.column_stack([X] + d)
+
+
+def lgbm_pipe(seed, **params):
+    return Pipeline([("f", FunctionTransformer(add_diffs)),
+                     ("m", LGBMClassifier(random_state=seed, subsample=0.8, subsample_freq=1,
+                                          colsample_bytree=0.8, n_jobs=1, verbose=-1, **params))])
+
+
+def svc_pipe(seed, **params):
+    return Pipeline([("m", SVC(probability=True, random_state=seed, **params))])
+
+
+def et_pipe(seed):
+    return Pipeline([("f", FunctionTransformer(add_diffs)),
+                     ("m", ExtraTreesClassifier(n_estimators=300, random_state=seed, n_jobs=1))])
+
+
+def make_ensemble(seed, lgb_params, svc_params):
+    return VotingClassifier([("lgb", lgbm_pipe(seed, **lgb_params)),
+                             ("svc", svc_pipe(seed, **svc_params)),
+                             ("et", et_pipe(seed))], voting="soft")
+
+
 X, y_raw = load()
 y = LabelEncoder().fit_transform(y_raw)
 print(f"loaded {X.shape}, classes={np.unique(y).size}", flush=True)
@@ -93,24 +125,46 @@ Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=0.2, stratify=y, random_st
 sc = StandardScaler().fit(Xtr)
 Xtr, Xte = sc.transform(Xtr), sc.transform(Xte)
 
-# --- tune LightGBM with 5-fold CV on the training set only ---
-lgb_base = dict(subsample=0.8, subsample_freq=1, colsample_bytree=0.8, learning_rate=0.1,
-                n_jobs=1, verbose=-1)
-grid = {"n_estimators": [20, 50, 100], "num_leaves": [4, 8, 16], "max_depth": [3, 4]}
-gs = GridSearchCV(LGBMClassifier(random_state=42, **lgb_base), grid, scoring="accuracy",
-                  cv=StratifiedKFold(5, shuffle=True, random_state=42), n_jobs=1)
-gs.fit(Xtr, ytr)
-best = gs.best_params_
-print(f"best LightGBM params {best}, cv acc {gs.best_score_:.4f}", flush=True)
+cv = StratifiedKFold(5, shuffle=True, random_state=42)
+
+# --- tune components with 5-fold CV on the training set only ---
+gs_l = GridSearchCV(lgbm_pipe(42), {"m__n_estimators": [50, 100, 200], "m__num_leaves": [4, 8, 16],
+                                    "m__learning_rate": [0.05, 0.1]},
+                    scoring="accuracy", cv=cv, n_jobs=1).fit(Xtr, ytr)
+lgb_best = {k[3:]: v for k, v in gs_l.best_params_.items()}
+print(f"best LightGBM params {lgb_best}, cv acc {gs_l.best_score_:.4f}", flush=True)
+
+gs_s = GridSearchCV(svc_pipe(42), {"m__C": [1, 3, 10, 30, 100], "m__gamma": [0.01, 0.03, 0.1, 0.3, "scale"]},
+                    scoring="accuracy", cv=cv, n_jobs=1).fit(Xtr, ytr)
+svc_best = {k[3:]: v for k, v in gs_s.best_params_.items()}
+print(f"best SVC params {svc_best}, cv acc {gs_s.best_score_:.4f}", flush=True)
+
+ens_cv = float(cross_val_score(make_ensemble(42, lgb_best, svc_best), Xtr, ytr, scoring="accuracy",
+                               cv=cv, n_jobs=1).mean())
+print(f"ensemble cv acc {ens_cv:.4f}", flush=True)
+
+# --- choose the final improved model by training-set CV accuracy only (ties favour the ensemble) ---
+cands = {"ensemble": ens_cv, "svc": float(gs_s.best_score_), "lightgbm": float(gs_l.best_score_)}
+choice = max(cands, key=lambda k: (cands[k], k == "ensemble"))
+print(f"selected improved model: {choice} (cv acc {cands[choice]:.4f})", flush=True)
+
+
+def build_improved(seed):
+    if choice == "ensemble":
+        return make_ensemble(seed, lgb_best, svc_best)
+    if choice == "svc":
+        return svc_pipe(seed, **svc_best)
+    return lgbm_pipe(seed, **lgb_best)
+
 
 # --- final fits for each seed, single test-set evaluation ---
 res = {"base": [], "imp": []}
 for s in SEEDS:
     mlp = MLPClassifier(hidden_layer_sizes=(100,), max_iter=500, random_state=s).fit(Xtr, ytr)
-    lgb = LGBMClassifier(random_state=s, **lgb_base, **best).fit(Xtr, ytr)
+    imp = build_improved(s).fit(Xtr, ytr)
     res["base"].append(evaluate(mlp, Xte, yte))
-    res["imp"].append(evaluate(lgb, Xte, yte))
-    print(f"seed {s}: MLP acc {res['base'][-1]['acc']:.4f} | LGBM acc {res['imp'][-1]['acc']:.4f}", flush=True)
+    res["imp"].append(evaluate(imp, Xte, yte))
+    print(f"seed {s}: MLP acc {res['base'][-1]['acc']:.4f} | improved ({choice}) acc {res['imp'][-1]['acc']:.4f}", flush=True)
 
 
 def agg(key, k):
@@ -128,7 +182,10 @@ for key, name in [("base", "baseline"), ("imp", "improved")]:
 metrics["improvement"] = metrics["improved_score"] - metrics["baseline_score"]
 metrics["speedup_single_sample"] = metrics["baseline_us_per_sample_single"] / metrics["improved_us_per_sample_single"]
 metrics["speedup_batch"] = metrics["baseline_us_per_sample_batch"] / metrics["improved_us_per_sample_batch"]
-metrics["lgbm_cv_accuracy"] = float(gs.best_score_)
+metrics["lgbm_cv_accuracy"] = float(gs_l.best_score_)
+metrics["svc_cv_accuracy"] = float(gs_s.best_score_)
+metrics["ensemble_cv_accuracy"] = ens_cv
+metrics["selected_model_cv_accuracy"] = float(cands[choice])
 if not all(np.isfinite(v) for v in metrics.values()) or metrics["baseline_score"] < 0.3:
     sys.exit("metrics not meaningful")
 
@@ -136,26 +193,27 @@ if not all(np.isfinite(v) for v in metrics.values()) or metrics["baseline_score"
 os.makedirs("figures", exist_ok=True)
 fig, ax = plt.subplots(1, 2, figsize=(9, 3.5))
 for a, k, t in [(ax[0], "score", "Test accuracy"), (ax[1], "us_per_sample_single", "Single-sample inference (µs)")]:
-    a.bar(["MLP", "LightGBM"], [metrics[f"baseline_{k}"], metrics[f"improved_{k}"]],
+    a.bar(["MLP", f"Improved ({choice})"], [metrics[f"baseline_{k}"], metrics[f"improved_{k}"]],
           yerr=[metrics[f"baseline_{k}_std"], metrics[f"improved_{k}_std"]])
     a.set_title(t)
 plt.tight_layout()
 plt.savefig("figures/comparison.png", dpi=120)
 
 out = {
-    "question": "Can a small cross-validation-tuned LightGBM model match or beat a standard MLP at indoor location classification from signal-strength readings, while being cheaper to run per prediction on a small device?",
-    "method": "One stratified 80/20 split (seed 42), shared standardisation fit on train. Baseline: sklearn MLPClassifier. Improved: small LightGBM tuned by 5-fold CV on the training set only. Test set used once; randomized models run with seeds 42, 43, 44 (means reported).",
+    "question": "Can a cross-validation-tuned model (LightGBM / SVM / ExtraTrees soft-voting ensemble with engineered pairwise-difference features) beat a standard MLP at indoor location classification from signal-strength readings?",
+    "method": "One stratified 80/20 split (seed 42), shared standardisation fit on train. Baseline: sklearn MLPClassifier. Improved: LightGBM (on raw + pairwise-difference features) and RBF-SVM tuned by 5-fold CV on the training set only, combined with ExtraTrees in a soft-voting ensemble; the final improved model (ensemble vs. single components) is chosen by training-set CV accuracy. Test set used once; randomized models run with seeds 42, 43, 44 (means reported).",
     "dataset": {"name": "UCI Wireless Indoor Localization", "source_url": "https://archive.ics.uci.edu/dataset/422/wireless+indoor+localization",
                 "n_rows": int(len(X)), "n_train": int(len(Xtr)), "n_test": int(len(Xte)),
                 "same_as_paper": False, "baseline_is_papers_method": False},
     "metric_name": "test accuracy", "higher_is_better": True,
     "baseline": "scikit-learn MLPClassifier, one hidden layer of 100 ReLU units, Adam, max_iter=500 (stand-in for the paper's deep model).",
-    "improved": "Small LightGBM classifier (shallow trees, few boosting rounds) with n_estimators, num_leaves and max_depth chosen by 5-fold CV on the training set.",
+    "improved": f"Selected by CV: {choice}. Candidates: soft-voting ensemble of CV-tuned LightGBM + CV-tuned RBF-SVC + ExtraTrees (300 trees), tree models use added pairwise signal-difference features.",
     "metrics": metrics,
     "notes": (f"Stand-in dataset, not the paper's RFID data; the paper's model (EDEEPRFID-IPS) is not reproduced. "
-              f"Selected LightGBM params: {best}. Hyper-parameters tuned once with seed 42; seeds only change final fits. "
-              "Data downloaded directly from the UCI static file (ucimlrepo import of id 422 is not available). "
-              "Timing is wall-clock on the CI CPU: LightGBM uses n_jobs=1, but the MLP's BLAS threads are not restricted, and "
+              f"Selected improved model: {choice}; LightGBM params {lgb_best}; SVC params {svc_best}. "
+              f"Training-set CV accuracy: {cands}. Hyper-parameters and model choice tuned once with seed 42 using CV on the training set only; "
+              "seeds only change final fits. The baseline MLP, split, scaler and evaluation code are unchanged. "
+              "Timing is wall-clock on the CI CPU; the ensemble is slower per prediction than a small LightGBM, and "
               "timings are noisy and are not measurements on a real small device. Accuracy differences may be within seed/split noise (single split)."),
 }
 with open("results.json", "w", encoding="utf-8") as f:

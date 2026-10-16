@@ -1,15 +1,19 @@
-# LightGBM vs MLP on UCI Wireless Indoor Localization
+# Indoor localization: MLP baseline vs. CV-tuned ensemble
 
-Question: can a small, cross-validation-tuned LightGBM classifier match or beat a standard MLP at indoor location classification from signal-strength readings, while being cheaper per prediction?
+Dataset: UCI Wireless Indoor Localization (id 422), 2000 rows, 7 signal-strength features, 4 classes.
 
-- Dataset: UCI Wireless Indoor Localization (id 422), 2000 rows, 7 WiFi signal-strength features, 4 classes. It is downloaded directly from the UCI static file, with `ucimlrepo` as a fallback. The `ucimlrepo` import of id 422 failed in CI, which is why the direct download was added.
-- Split: one stratified 80/20 split, seed 42. The scaler is fit on the training set only.
-- Baseline: scikit-learn `MLPClassifier` (100 hidden units, max_iter=500).
-- Improved: small LightGBM, tuned with 5-fold CV on the training set only.
-- Final models are run with seeds 42, 43 and 44, and the means are reported. The test set is used once.
-- Output: `results.json` and `figures/comparison.png`.
+- Split: one stratified 80/20 split (seed 42); the scaler is fit on the training set only. Both models use it.
+- Baseline (unchanged): scikit-learn `MLPClassifier` with 100 hidden units and `max_iter=500`.
+- Improved: a soft-voting ensemble of LightGBM, RBF-SVM and ExtraTrees.
+  - The tree models also get pairwise signal-difference features.
+  - LightGBM and SVM hyper-parameters are tuned with 5-fold CV on the training set only.
+  - The final model (ensemble or a single component) is chosen by training-set CV accuracy.
+- The test set is used once, for final evaluation. Randomized models run with seeds 42, 43 and 44, and the means are reported.
+- Outputs: `results.json` and `figures/comparison.png`.
 
 Run: `pip install -r requirements.txt && python analysis.py`
+
+Notes: this is a stand-in dataset, not the original paper's data. Timings are noisy CI wall-clock numbers, and the ensemble is slower per prediction than a small LightGBM.
 
 ## Reference
 
